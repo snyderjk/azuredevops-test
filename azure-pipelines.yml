@@ -22,7 +22,7 @@ steps:
     displayName: Install deploy SSH key
     inputs:
       knownHostsEntry: $(TARGET_VM_KNOWN_HOSTS)
-      sshKeySecureFile: target-vm-deploy-key
+      sshKeySecureFile: ado-deploy
 
   - bash: |
       set -euo pipefail
