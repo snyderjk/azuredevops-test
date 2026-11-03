@@ -43,7 +43,7 @@ GitHub ──(OIDC/ARM API)──> VMSS (0→1) ──run-command──> runner 
 | --- | --- |
 | `AZURE_RESOURCE_GROUP` | `rg-poc` |
 | `VMSS_NAME` | `vmss-runner` |
-| `TARGET_VM_IP` | `10.0.2.4` |
+| `TARGET_VM_IP` | `10.0.1.4` |
 | `TARGET_VM_USER` | `azureuser` |
 | `TARGET_PATH` *(optional)* | `/tmp/` (default) |
 | `SOURCE_FILE` *(optional)* | `files/hello.txt` (default) |
