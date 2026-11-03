@@ -1,0 +1,137 @@
+name: Deploy file to private VM
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # Azure OIDC login
+  contents: read
+
+# Only one run at a time touches the VMSS capacity.
+concurrency:
+  group: vmss-runner
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  VMSS_NAME: ${{ vars.VMSS_NAME }}
+
+jobs:
+  # 1. GitHub-hosted: scale VMSS 0 -> 1 and turn the instance into an ephemeral self-hosted runner.
+  start-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.vars.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: vars
+        run: echo "label=vmss-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Scale VMSS up
+        run: az vmss scale -g "$RESOURCE_GROUP" -n "$VMSS_NAME" --new-capacity 1 -o none
+
+      - name: Get runner registration token and version
+        id: runner
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_ADMIN_PAT }}
+        run: |
+          token=$(gh api -X POST "repos/${{ github.repository }}/actions/runners/registration-token" --jq .token)
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+          version=$(gh api repos/actions/runner/releases/latest --jq .tag_name | sed 's/^v//')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Register runner on VMSS instance
+        run: |
+          args=(--command-id RunShellScript --scripts @scripts/register-runner.sh
+                --parameters "${{ github.server_url }}/${{ github.repository }}"
+                             "${{ steps.runner.outputs.token }}"
+                             "${{ steps.vars.outputs.label }}"
+                             "${{ steps.runner.outputs.version }}"
+                --query "value[].message" -o tsv)
+
+          mode=$(az vmss show -g "$RESOURCE_GROUP" -n "$VMSS_NAME" --query orchestrationMode -o tsv)
+          if [ "$mode" = "Flexible" ]; then
+            vm=$(az vmss list-instances -g "$RESOURCE_GROUP" -n "$VMSS_NAME" --query "[0].name" -o tsv)
+            az vm run-command invoke -g "$RESOURCE_GROUP" -n "$vm" "${args[@]}"
+          else
+            id=$(az vmss list-instances -g "$RESOURCE_GROUP" -n "$VMSS_NAME" --query "[0].instanceId" -o tsv)
+            az vmss run-command invoke -g "$RESOURCE_GROUP" -n "$VMSS_NAME" --instance-id "$id" "${args[@]}"
+          fi
+
+      # Fail fast here rather than leaving copy-file queued forever if registration broke.
+      - name: Wait for runner to come online
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_ADMIN_PAT }}
+          LABEL: ${{ steps.vars.outputs.label }}
+        run: |
+          for i in $(seq 1 30); do
+            status=$(gh api "repos/${{ github.repository }}/actions/runners" \
+              --jq ".runners[] | select(.name == \"$LABEL\") | .status")
+            echo "Attempt $i: ${status:-not registered}"
+            [ "$status" = "online" ] && exit 0
+            sleep 10
+          done
+          echo "::error::Runner $LABEL never came online"
+          exit 1
+
+  # 2. Runs on the VMSS instance inside the VNet, so it can reach the private VM.
+  copy-file:
+    needs: start-runner
+    runs-on: [self-hosted, "${{ needs.start-runner.outputs.label }}"]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy file to private VM
+        env:
+          SSH_KEY: ${{ secrets.TARGET_VM_SSH_KEY }}
+          TARGET: ${{ vars.TARGET_VM_USER }}@${{ vars.TARGET_VM_IP }}
+          SRC: ${{ vars.SOURCE_FILE || 'files/hello.txt' }}
+          DEST: ${{ vars.TARGET_PATH || '/tmp/' }}
+        run: |
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$SSH_KEY" > "$key"
+          chmod 600 "$key"
+          ssh_opts=(-i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+
+          scp "${ssh_opts[@]}" "$SRC" "$TARGET:$DEST"
+          ssh "${ssh_opts[@]}" "$TARGET" "ls -l $DEST"
+
+  # 3. Always scale back to 0 and clean up any leftover runner registration.
+  stop-runner:
+    needs: [start-runner, copy-file]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Scale VMSS down
+        run: az vmss scale -g "$RESOURCE_GROUP" -n "$VMSS_NAME" --new-capacity 0 -o none
+
+      - name: Remove stale runner registration
+        if: needs.start-runner.outputs.label != ''
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_ADMIN_PAT }}
+          LABEL: ${{ needs.start-runner.outputs.label }}
+        run: |
+          ids=$(gh api "repos/${{ github.repository }}/actions/runners" \
+            --jq ".runners[] | select(.name == \"$LABEL\") | .id")
+          for id in $ids; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/runners/$id"
+            echo "Removed runner $id"
+          done

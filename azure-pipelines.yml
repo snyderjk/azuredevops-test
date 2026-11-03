@@ -1,0 +1,43 @@
+# On every push to main, Azure DevOps scales up an ephemeral agent in the VMSS pool
+# (inside the VNet), copies cron-logger/ to the private VM, and runs its setup script.
+# The pool is configured to tear down the VM after each job, so every run gets a fresh agent.
+
+trigger:
+  branches:
+    include: [main]
+pr: none
+
+pool:
+  name: vmss-agents # Azure VMSS agent pool (Project settings -> Agent pools)
+
+variables:
+  - group: target-vm # TARGET_VM_IP, TARGET_VM_USER, TARGET_VM_KNOWN_HOSTS
+
+steps:
+  - checkout: self
+
+  # Loads the private key from Pipelines > Library > Secure files into ssh-agent
+  # and pins the target's host key, so no StrictHostKeyChecking=no is needed.
+  - task: InstallSSHKey@0
+    displayName: Install deploy SSH key
+    inputs:
+      knownHostsEntry: $(TARGET_VM_KNOWN_HOSTS)
+      sshKeySecureFile: target-vm-deploy-key
+
+  - bash: |
+      set -euo pipefail
+      ssh -o BatchMode=yes "$TARGET" 'rm -rf ~/deploy && mkdir -p ~/deploy'
+      scp -o BatchMode=yes -r cron-logger "$TARGET:~/deploy/"
+      ssh -o BatchMode=yes "$TARGET" 'sudo ~/deploy/cron-logger/setup.sh'
+    displayName: Copy files and run setup on target VM
+    env:
+      TARGET: $(TARGET_VM_USER)@$(TARGET_VM_IP)
+
+  - bash: |
+      set -euo pipefail
+      echo "Waiting for cron to fire..."
+      sleep 70
+      ssh -o BatchMode=yes "$TARGET" 'tail -n 5 /var/log/heartbeat/heartbeat.log'
+    displayName: Verify cron is writing the log
+    env:
+      TARGET: $(TARGET_VM_USER)@$(TARGET_VM_IP)

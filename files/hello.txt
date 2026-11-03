@@ -1,0 +1,1 @@
+Hello from GitHub Actions — deployed via ephemeral VMSS runner.
