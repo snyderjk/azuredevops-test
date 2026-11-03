@@ -55,3 +55,5 @@ GitHub ──(OIDC/ARM API)──> VMSS (0→1) ──run-command──> runner 
   Run Command logs. It's single-use and expires in 1 hour, but a GitHub App or baking registration
   into the VMSS custom data is cleaner.
 - A single shared VMSS + `concurrency` group means runs are serialized.
+
+Test CI/CI Pipeline
